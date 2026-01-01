@@ -3,20 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Http\Requests\ImportCsvRequest;
-use App\Models\Author;
-use App\Models\Book;
-use App\Models\Genre;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
+use App\Jobs\ImportBooksJob;
+use App\Models\ImportLog;
 use Exception;
+use Illuminate\Http\JsonResponse;
 
 class ImportController extends Controller
 {
     /**
      * API status check.
-     *
-     * @return JsonResponse
      */
     public function status(): JsonResponse
     {
@@ -25,242 +20,76 @@ class ImportController extends Controller
             'message' => 'Book Import API is running',
             'timestamp' => now()->toDateTimeString(),
             'endpoints' => [
-                'POST /api/import' => 'Import books from CSV file',
+                'POST /api/import' => 'Import books from CSV file (async)',
+                'GET /api/import/{id}' => 'Check import status',
             ],
         ], 200);
     }
 
     /**
-     * Import books from CSV file.
-     *
-     * @param ImportCsvRequest $request
-     * @return JsonResponse
+     * Import books from CSV file (async via queue).
      */
     public function import(ImportCsvRequest $request): JsonResponse
     {
         try {
             $file = $request->file('file');
-            
-            // Open file for reading
-            $handle = fopen($file->getRealPath(), 'r');
-            
-            if ($handle === false) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Failed to open file.',
-                ], 500);
-            }
+            $filename = $file->getClientOriginalName();
 
-            // Read headers
-            $headers = fgetcsv($handle);
-            
-            // Clean headers from BOM and spaces
-            if ($headers) {
-                $headers = array_map(function($header) {
-                    $header = str_replace("\xEF\xBB\xBF", '', $header);
-                    return trim($header);
-                }, $headers);
-            }
-            
-            if (!$this->validateHeaders($headers)) {
-                fclose($handle);
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Invalid CSV file structure. Expected columns: Authors, Title, Genre, Description, Edition, Publisher, Year, Format, Pages, Country, ISBN',
-                    'received_headers' => $headers,
-                ], 422);
-            }
+            // Store file temporarily
+            $path = $file->store('imports', 'local');
 
-            $importedCount = 0;
-            $errors = [];
-            $rowNumber = 1; // Start from 1, as 0 is headers
+            // Create import log
+            $importLog = ImportLog::create([
+                'filename' => $filename,
+                'status' => 'pending',
+            ]);
 
-            // Process each row in transaction
-            DB::beginTransaction();
+            // Dispatch job to queue
+            ImportBooksJob::dispatch($importLog->id, $path);
 
-            try {
-                while (($row = fgetcsv($handle)) !== false) {
-                    $rowNumber++;
-                    
-                    try {
-                        $this->processRow($row, $headers);
-                        $importedCount++;
-                    } catch (Exception $e) {
-                        $errors[] = [
-                            'row' => $rowNumber,
-                            'error' => $e->getMessage(),
-                        ];
-                        
-                        // If there's an error, rollback entire transaction
-                        throw new Exception("Error in row {$rowNumber}: {$e->getMessage()}");
-                    }
-                }
-
-                DB::commit();
-                fclose($handle);
-
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Import completed successfully.',
-                    'imported_count' => $importedCount,
-                ], 200);
-
-            } catch (Exception $e) {
-                DB::rollBack();
-                fclose($handle);
-
-                Log::error('CSV Import Error', [
-                    'message' => $e->getMessage(),
-                    'errors' => $errors,
-                ]);
-
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Import error: ' . $e->getMessage(),
-                    'errors' => $errors,
-                ], 422);
-            }
-
+            return response()->json([
+                'success' => true,
+                'message' => 'Import started. Use the import_id to check status.',
+                'import_id' => $importLog->id,
+                'check_status_url' => url("/api/import/{$importLog->id}"),
+            ], 202); // 202 Accepted
         } catch (Exception $e) {
-            Log::error('CSV Import Fatal Error', ['message' => $e->getMessage()]);
-            
             return response()->json([
                 'success' => false,
-                'message' => 'Critical import error: ' . $e->getMessage(),
-            ], 500);
+                'message' => 'Failed to start import: '.$e->getMessage(),
+            ], 422);
         }
     }
 
     /**
-     * Validate CSV headers.
-     *
-     * @param array|null $headers
-     * @return bool
+     * Check import status.
      */
-    private function validateHeaders(?array $headers): bool
+    public function importStatus(int $id): JsonResponse
     {
-        if ($headers === null) {
-            return false;
+        $importLog = ImportLog::find($id);
+
+        if (! $importLog) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Import not found.',
+            ], 404);
         }
 
-        $expectedHeaders = [
-            'Authors', 'Title', 'Genre', 'Description', 'Edition', 
-            'Publisher', 'Year', 'Format', 'Pages', 'Country', 'ISBN'
+        $response = [
+            'success' => true,
+            'import_id' => $importLog->id,
+            'filename' => $importLog->filename,
+            'status' => $importLog->status,
+            'started_at' => $importLog->started_at?->toDateTimeString(),
+            'completed_at' => $importLog->completed_at?->toDateTimeString(),
         ];
 
-        // Log for debugging
-        Log::debug('CSV Headers validation', [
-            'received' => $headers,
-            'expected' => $expectedHeaders,
-            'match' => $headers === $expectedHeaders
-        ]);
-
-        return $headers === $expectedHeaders;
-    }
-
-    /**
-     * Process a single CSV row.
-     *
-     * @param array $row
-     * @param array $headers
-     * @return void
-     * @throws Exception
-     */
-    private function processRow(array $row, array $headers): void
-    {
-        // Create associative array from data
-        $data = array_combine($headers, $row);
-
-        // Validate required fields
-        if (empty($data['Title']) || empty($data['ISBN'])) {
-            throw new Exception('Title and ISBN are required fields.');
+        if (in_array($importLog->status, ['completed', 'failed'])) {
+            $response['imported_count'] = $importLog->imported_count;
+            $response['failed_count'] = $importLog->failed_count;
+            $response['errors'] = $importLog->errors;
         }
 
-        // Check if book with this ISBN already exists
-        if (Book::where('isbn', $data['ISBN'])->exists()) {
-            throw new Exception("Book with ISBN {$data['ISBN']} already exists in database.");
-        }
-
-        // Create or find authors
-        $authors = $this->processAuthors($data['Authors']);
-
-        // Create or find genres
-        $genres = $this->processGenres($data['Genre']);
-
-        // Create book
-        $book = Book::create([
-            'title' => $data['Title'],
-            'description' => $data['Description'] ?: null,
-            'edition' => $data['Edition'] ?: null,
-            'publisher' => $data['Publisher'] ?: null,
-            'year' => !empty($data['Year']) ? $data['Year'] : null,
-            'format' => $data['Format'] ?: null,
-            'pages' => !empty($data['Pages']) ? (int)$data['Pages'] : null,
-            'country' => $data['Country'] ?: null,
-            'isbn' => $data['ISBN'],
-        ]);
-
-        // Attach authors and genres
-        if (!empty($authors)) {
-            $book->authors()->attach($authors);
-        }
-
-        if (!empty($genres)) {
-            $book->genres()->attach($genres);
-        }
-    }
-
-    /**
-     * Process authors from CSV field (split by semicolon).
-     *
-     * @param string|null $authorsString
-     * @return array
-     */
-    private function processAuthors(?string $authorsString): array
-    {
-        if (empty($authorsString)) {
-            return [];
-        }
-
-        $authorNames = array_map('trim', explode(';', $authorsString));
-        $authorIds = [];
-
-        foreach ($authorNames as $name) {
-            if (empty($name)) {
-                continue;
-            }
-
-            $author = Author::firstOrCreate(['name' => $name]);
-            $authorIds[] = $author->id;
-        }
-
-        return $authorIds;
-    }
-
-    /**
-     * Process genres from CSV field (split by semicolon).
-     *
-     * @param string|null $genresString
-     * @return array
-     */
-    private function processGenres(?string $genresString): array
-    {
-        if (empty($genresString)) {
-            return [];
-        }
-
-        $genreNames = array_map('trim', explode(';', $genresString));
-        $genreIds = [];
-
-        foreach ($genreNames as $name) {
-            if (empty($name)) {
-                continue;
-            }
-
-            $genre = Genre::firstOrCreate(['name' => $name]);
-            $genreIds[] = $genre->id;
-        }
-
-        return $genreIds;
+        return response()->json($response, 200);
     }
 }
